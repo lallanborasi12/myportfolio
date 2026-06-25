@@ -1,0 +1,154 @@
+name: Deploy Next.js App to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Application
+        run: npm run build
+
+      - name: Create SSH Key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+      - name: Create Backup On Server
+        run: |
+          ssh -i private_key.pem \
+          -o StrictHostKeyChecking=no \
+          ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} << 'EOF'
+
+          APP_DIR=/var/www/portfolio
+          BACKUP_DIR=/var/www/backups
+
+          sudo mkdir -p $BACKUP_DIR
+
+          if [ -d "$APP_DIR" ]; then
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+            echo "Creating Backup..."
+
+            sudo tar -czf \
+            $BACKUP_DIR/backup_${TIMESTAMP}.tar.gz \
+            -C $APP_DIR .
+
+            echo "Backup Created"
+          fi
+
+          # Keep only last 5 backups
+          sudo bash -c "
+          ls -tp $BACKUP_DIR/*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm --
+          "
+
+          EOF
+
+      - name: Deploy Files
+        run: |
+          rsync -rvz \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'node_modules' \
+            --exclude '.DS_Store' \
+            --exclude 'private_key.pem' \
+            --exclude '.next/cache' \
+            --no-times \
+            -e "ssh -i private_key.pem -o StrictHostKeyChecking=no" \
+            ./ \
+            ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}:/var/www/portfolio/
+
+      - name: Install Dependencies & Restart PM2
+        run: |
+          ssh -i private_key.pem \
+          -o StrictHostKeyChecking=no \
+          ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} << 'EOF'
+
+          cd /var/www/portfolio
+
+          npm ci
+
+          if pm2 describe portfolio > /dev/null 2>&1
+          then
+            pm2 restart portfolio
+          else
+            pm2 start npm --name "portfolio" -- start
+          fi
+
+          pm2 save
+
+          EOF
+
+      - name: Verify Deployment
+        run: |
+          sleep 15
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          http://${{ secrets.EC2_HOST }})
+
+          echo "HTTP Status: $STATUS"
+
+          if [ "$STATUS" = "200" ] || \
+             [ "$STATUS" = "301" ] || \
+             [ "$STATUS" = "302" ]; then
+            echo "Deployment Successful"
+            exit 0
+          fi
+
+          echo "Deployment Failed"
+          exit 1
+
+      - name: Rollback On Failure
+        if: failure()
+        run: |
+          ssh -i private_key.pem \
+          -o StrictHostKeyChecking=no \
+          ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} << 'EOF'
+
+          APP_DIR=/var/www/portfolio
+          BACKUP_DIR=/var/www/backups
+
+          LATEST_BACKUP=$(ls -t $BACKUP_DIR/*.tar.gz | head -1)
+
+          if [ -n "$LATEST_BACKUP" ]; then
+
+            echo "Rolling Back..."
+
+            rm -rf $APP_DIR/*
+
+            tar -xzf $LATEST_BACKUP -C $APP_DIR
+
+            cd $APP_DIR
+
+            npm ci
+
+            pm2 restart portfolio
+
+            echo "Rollback Complete"
+
+          fi
+
+          EOF
+
+      - name: Cleanup
+        if: always()
+        run: rm -f private_key.pem
+        
+
